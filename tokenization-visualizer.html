@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tokenizer Visualization</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f7f7f8;
+    --border: #e3e3e6;
+    --text: #202123;
+    --muted: #6e6e80;
+    --accent: #10a37f;
+    --accent-bg: #d7f5e9;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 48px 16px;
+  }
+  main { width: 100%; max-width: 620px; }
+
+  /* Tab selector: tokenizer variants */
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab {
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .tab.active { background: var(--accent-bg); }
+
+  textarea {
+    width: 100%;
+    min-height: 160px;
+    resize: vertical;
+    padding: 14px 16px;
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 14.5px;
+    line-height: 1.7;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    outline: none;
+  }
+  textarea:focus { border-color: #c5c5cc; }
+
+  .actions { display: flex; gap: 10px; margin-top: 12px; }
+  .btn {
+    padding: 8px 18px;
+    border: none;
+    border-radius: 8px;
+    background: #ececf1;
+    color: var(--text);
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn:hover { background: #e0e0e6; }
+
+  /* Counts */
+  .counts { display: flex; gap: 48px; margin-top: 28px; }
+  .counts .label { font-size: 16px; font-weight: 700; }
+  .counts .value { font-size: 30px; margin-top: 2px; }
+
+  /* Token display panel */
+  .panel {
+    margin-top: 20px;
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 18px 16px 14px;
+  }
+  .token-stream {
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 14px;
+    line-height: 2;
+    word-break: break-word;
+  }
+  .tok {
+    border-radius: 3px;
+    padding: 1px 0;
+    white-space: pre-wrap;
+    cursor: default;
+  }
+  .empty-note { color: var(--muted); font-style: italic; }
+
+  .toggle-row { margin-top: 14px; display: inline-flex; gap: 0; }
+  .seg {
+    padding: 7px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    background: #ececf1;
+    border: 2px solid #ececf1;
+    cursor: pointer;
+  }
+  .seg:first-child { border-radius: 8px 0 0 8px; }
+  .seg:last-child  { border-radius: 0 8px 8px 0; }
+  .seg.active { background: #ffffff; border-color: var(--accent); color: var(--accent); }
+
+  .footnote { margin-top: 10px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <!-- Tokenizer variant selector, mirroring the reference UI -->
+  <div class="tabs" id="tabs"></div>
+
+  <textarea id="input" placeholder="Type text to see how it splits into tokens…" spellcheck="false"></textarea>
+
+  <div class="actions">
+    <button class="btn" id="clear">Clear</button>
+    <button class="btn" id="example">Show example</button>
+  </div>
+
+  <div class="counts">
+    <div><div class="label">Tokens</div><div class="value" id="tokenCount">0</div></div>
+    <div><div class="label">Characters</div><div class="value" id="charCount">0</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="token-stream" id="tokenStream"></div>
+    <div class="toggle-row">
+      <button class="seg active" data-view="text">Text</button>
+      <button class="seg" data-view="ids">Token IDs</button>
+    </div>
+    <div class="footnote" id="footnote"></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------
+ * Tokenizer engines
+ * In a browser-only tool we can't ship real BPE vocab files
+ * (GPT-2's vocab is ~1MB+), so each variant here uses a faithful
+ * GPT-style regex pre-tokenizer (same pattern tiktoken/OpenAI use)
+ * plus a greedy subword split for long words to emulate BPE output.
+ * ------------------------------------------------------------- */
+
+// GPT-2/GPT-3 style pre-tokenization pattern: contractions, words,
+// numbers, whitespace runs, other symbols.
+const GPT2_PATTERN = /'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?\d+| ?[^\sA-Za-z\d]+|\s+(?!\S)|\s+/g;
+
+// Common English pieces used for the subword emulation, sorted
+// longest-first so greedy matching prefers bigger chunks.
+const SUBWORD_PARTS = [
+  "ing", "tion", "ness", "ment", "able", "ation", "ally", "est", "ers",
+  "pre", "un", "re", "in", "de", "con", "dis", "en", "ed", "ly", "er",
+  "or", "an", "th", "is", "ou", "ar", "en", "te", "al", "ic", "ion",
+  "ed", "es", "s",
+];
+
+// Tokenizer variants shown as tabs. "Legacy" splits a bit more
+// coarsely (fewer tokens) to mirror GPT-3's different vocab.
+const VARIANTS = [
+  { name: "GPT-3.5 & GPT-4", maxPart: 4, idBase: 50000 },
+  { name: "GPT-3 (Legacy)",  maxPart: 5, idBase: 12000 },
+];
+
+let activeVariant = 0;
+let view = "text"; // "text" | "ids"
+
+const input = document.getElementById("input");
+const tokenStream = document.getElementById("tokenStream");
+const tokenCount = document.getElementById("tokenCount");
+const charCount = document.getElementById("charCount");
+const footnote = document.getElementById("footnote");
+
+/* --- Tokenization --------------------------------------------- */
+
+// Split one chunk (a word without leading space) into subword
+// pieces with greedy longest-match, capped by variant granularity.
+function splitSubwords(word, maxPart) {
+  const parts = [];
+  let rest = word;
+  while (rest.length > 0) {
+    let size = Math.min(maxPart, rest.length);
+    // Try to land on a known suffix boundary, else hard cut.
+    let matched = size;
+    for (; size >= 1; size--) {
+      if (SUBWORD_PARTS.includes(rest.slice(0, size).toLowerCase())) {
+        matched = size;
+        break;
+      }
+    }
+    parts.push(rest.slice(0, matched));
+    rest = rest.slice(matched);
+  }
+  return parts;
+}
+
+function tokenize(text, variant) {
+  const { maxPart, idBase } = variant;
+  const tokens = [];
+  let m;
+  GPT2_PATTERN.lastIndex = 0;
+  while ((m = GPT2_PATTERN.exec(text)) !== null) {
+    const chunk = m[0];
+    const leadingSpace = chunk.startsWith(" ") ? " " : "";
+    const core = leadingSpace ? chunk.slice(1) : chunk;
+    if (core === "") { tokens.push(chunk); continue; }
+
+    // Short words are single tokens (like real BPE for common words)
+    if (core.length <= maxPart || /^[^\sA-Za-z\d]+$/.test(core)) {
+      tokens.push(chunk);
+    } else {
+      // Split word, re-attaching the leading space to the first piece
+      const parts = splitSubwords(core, maxPart);
+      parts.forEach((p, i) => tokens.push(i === 0 ? leadingSpace + p : p));
+    }
+  }
+  // Map each token to a stable pseudo token ID (hash-based, per variant)
+  return tokens.map((t) => ({ text: t, id: pseudoId(t, idBase) }));
+}
+
+// Deterministic pseudo token ID from a string hash.
+function pseudoId(tok, idBase) {
+  let h = 2166136261;
+  for (let i = 0; i < tok.length; i++) {
+    h ^= tok.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return idBase + (h >>> 0) % 100000;
+}
+
+/* --- Rendering -------------------------------------------------- */
+
+// 10 distinct pastel background colors, cycled across tokens.
+const COLORS = [
+  "#d7c5f0", "#a8e6cf", "#ffd3a5", "#a0c8f0", "#f6a6b2",
+  "#c4e8a0", "#f5e08e", "#b8dff0", "#e8b8d8", "#c9b8e8",
+];
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function render() {
+  const text = input.value;
+  const variant = VARIANTS[activeVariant];
+  const tokens = tokenize(text, variant);
+
+  tokenCount.textContent = tokens.length;
+  charCount.textContent = text.length;
+
+  if (tokens.length === 0) {
+    tokenStream.innerHTML = '<span class="empty-note">Tokens will appear here…</span>';
+    footnote.textContent = "";
+    return;
+  }
+
+  if (view === "text") {
+    tokenStream.innerHTML = tokens
+      .map((t, i) =>
+        `<span class="tok" style="background:${COLORS[i % COLORS.length]}" title="Token ID: ${t.id}">${escapeHtml(t.text)}</span>`
+      )
+      .join("");
+  } else {
+    tokenStream.innerHTML = tokens
+      .map((t, i) =>
+        `<span class="tok" style="background:${COLORS[i % COLORS.length]}" title="${escapeHtml(t.text)}">${t.id}</span>`
+      )
+      .join(" ");
+  }
+  footnote.textContent =
+    `Tokenizer: ${variant.name} · approximation using GPT-style pre-tokenization (client-side demo, no network calls)`;
+}
+
+/* --- UI wiring ---------------------------------------------------- */
+
+const tabsEl = document.getElementById("tabs");
+VARIANTS.forEach((v, i) => {
+  const b = document.createElement("button");
+  b.className = "tab" + (i === 0 ? " active" : "");
+  b.textContent = v.name;
+  b.addEventListener("click", () => {
+    activeVariant = i;
+    tabsEl.querySelectorAll(".tab").forEach((t, j) => t.classList.toggle("active", j === i));
+    render();
+  });
+  tabsEl.appendChild(b);
+});
+
+document.getElementById("clear").addEventListener("click", () => {
+  input.value = "";
+  render();
+  input.focus();
+});
+
+// Cycle through demo sentences on each click
+const EXAMPLES = [
+  "Have the bards who preceded me left any theme unsung?",
+  "A tired Fox can't not  across street",
+];
+let exampleIdx = 0;
+document.getElementById("example").addEventListener("click", () => {
+  input.value = EXAMPLES[exampleIdx % EXAMPLES.length];
+  exampleIdx++;
+  render();
+});
+
+document.querySelectorAll(".seg").forEach((b) =>
+  b.addEventListener("click", () => {
+    view = b.dataset.view;
+    document.querySelectorAll(".seg").forEach((s) => s.classList.toggle("active", s === b));
+    render();
+  })
+);
+
+let raf = 0;
+input.addEventListener("input", () => {
+  cancelAnimationFrame(raf);
+  raf = requestAnimationFrame(render); // debounce redraws while typing
+});
+
+render();
+</script>
+</body>
+</html>
